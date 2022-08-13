@@ -1,0 +1,7 @@
+/venv/
+/__pycache__/
+/folder/
+/.idea/
+/logs/*
+/creds.json
+/pricelistkeys.*

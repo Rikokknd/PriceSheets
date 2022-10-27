@@ -8,7 +8,58 @@ import sys
 from oauth2client.service_account import ServiceAccountCredentials
 import openpyxl
 import gspread
+import requests
+import io
+import os
 from gspread_formatting import *
+
+URL = "https://89.248.193.157:65002/price/PRC%20(XLSX).xlsx"
+FOLDER = "/var/www/u0853380/data/priceSheets/"
+requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+
+
+def grab_url_file_to_memory(url):
+    """Берем файл по ссылке и записываем в память, возвращаем в виде потока байтов."""
+    r = requests.get(url, verify=False)
+    f = io.BytesIO(r.content)
+    return f
+
+
+def xlsx_compare(first, second):
+    """Принимаем 2 xlsx-файла, снимаем объединения ячеек в обоих.
+    Перегоняем данные из ячеек в массивы. Возвращаем результат сравнения массивов."""
+    wb_first = openpyxl.load_workbook(first).active
+
+    for merge in list(wb_first.merged_cells):
+        wb_first.unmerge_cells(range_string=str(merge))
+
+    wb_second = openpyxl.load_workbook(second).active
+
+    for merge in list(wb_second.merged_cells):
+        wb_second.unmerge_cells(range_string=str(merge))
+
+    row_new_list = []
+    row_old_list = []
+
+    for row_new, row_old in zip(wb_first.iter_rows(), wb_second.iter_rows()):
+        [row_new_list.append([cell_new.coordinate, cell_new.internal_value]) for cell_new in row_new]
+        [row_old_list.append([cell_old.coordinate, cell_old.internal_value]) for cell_old in row_old]
+
+    return row_new_list == row_old_list
+
+
+@singleton
+def logger():
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
+                        level=logging.INFO, filename=FOLDER + f'logs/{datetime.now().strftime("%m_%d_%Y")}.log',
+                        filemode='a')
+    log_maker = logging.getLogger(__name__)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    log_maker.addHandler(handler)
+    return log_maker
 
 
 @singleton
@@ -19,19 +70,22 @@ class Header:
         self._header_text_rows = {'phone': "Телефон: 071-312-3-777, Эдгар",
                                   'address': "ул. Буденновских партизан, 83а(рынок Объединенный, кольцо трамвая)",
                                   'hours': "Ежедневно 10.00-18.00",
-                                  'DT': f"Последнее обновление: {(datetime.now().strftime('%H:%M %d/%m'))}"}  # + timedelta(hours=3)).strftime('%H:%M %d/%m')}"}
+                                  'DT': f"Последнее обновление: {datetime.now().strftime('%H:%M %d/%m')}"}
         self._col_dict = {}
         self._keywords = []
         self._set_keywords()
 
-    def parse_header(self, row):
-        for cell in row:
-            self._col_dict[cell.column] = cell.value
+    def parse_header(self, *rows):
+        """Получаем несколько рядов из заголовка, считываем названия колонок, возвращаем объект Header."""
+        for row in rows:
+            for cell in row:
+                if cell.value and cell.value != 'Цена':
+                    self._col_dict[cell.column] = cell.value
         return self
 
     def _set_keywords(self):
         self._keywords = [["Xiaomi", "Redmi"], ["iPhone", "iPh"], ["Huawei"], ["Samsung"],
-                          ["Oppo", "Realme"], ["Meizu"], ['Nokia'], ['ZTE'], ['SONY'],
+                          ["Realme", "Oppo"], ["Meizu"], ['Nokia'], ['ZTE'], ['SONY'],
                           ['LENOVO'], ['onePlus'], ['LeEco'], ['Разборка телефонов', 'Б/У'], ["Остальное"]]
 
     def get_keywords(self):
@@ -72,7 +126,7 @@ class GoogleSpreadsheetEditor:
                  "https://www.googleapis.com/auth/drive",
                  "https://www.googleapis.com/auth/drive.readonly",
                  "https://www.googleapis.com/auth/spreadsheets.readonly"]
-        credentials = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
+        credentials = ServiceAccountCredentials.from_json_keyfile_name(FOLDER + "creds.json", scope)
         client = gspread.authorize(credentials)
         book = client.open("Запчасти для телефонов, ноутбуков")
         return book
@@ -129,7 +183,7 @@ class Item:
         keywords = Header().get_keywords()  # тянем список названий страниц
         # Если в названии товара содержится ключевое слово из названия страницы - добавляем принадлежность этой странице
         for i in range(len(keywords)):
-            if any(brand_name.lower() in self._properties['Наименование'].lower() for brand_name in keywords[i]):
+            if any(brand_name.lower() in self._properties['Номенклатура'].lower() for brand_name in keywords[i]):
                 self._properties['page'].append(i)
         if len(self._properties['page']) == 0:
             # если ни одного слова не совпало - добавляем на последнюю страницу
@@ -170,7 +224,7 @@ class ItemGroup(object):
         self.parent = new_parent
 
     def set_header(self, header_row):
-        self.header_row = header_row[1].value
+        self.header_row = header_row[0].value
 
     def get_header(self):
         return self.header_row
@@ -255,33 +309,16 @@ class PriceList:
     """Корневой класс. Содержит заголовок, список ключевых слов для генерации страниц прайса,
     список групп, страницы прайса, позже добавлю еще что-нибудь."""
 
-    def __init__(self, link_to_file=None):
-        self._logger = self.logger()
-        self._logger.info("============================================================")
-        self._logger.info("Obtaining file... Logging time is off -3 hours.")
+    def __init__(self, log_machine, link_to_file=None):
+        self._logger = log_machine
         self._worksheet = openpyxl.load_workbook(link_to_file).active
-        self._logger.info("Got it.")
-        self._worksheet['B2'] = "Main"
-        self._header = Header().parse_header(self._worksheet[3])
+        self._header = Header().parse_header(self._worksheet[1], self._worksheet[2])
         self._groups = self._parse_groups()
         self._sheet_keywords = Header().get_keywords()
         self._item_pages = self._create_pages()
         self._editor = GoogleSpreadsheetEditor()
         self.send_pages()
         self._logger.info("Finished.")
-
-    @staticmethod
-    def logger():
-        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
-                            level=logging.INFO, filename=f'logs/{datetime.now().strftime("%m_%d_%Y")}.log',
-                            filemode='a')
-        log = logging.getLogger(__name__)
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        log.addHandler(handler)
-        return log
 
     def _parse_groups(self) -> ItemGroup:
         """Запускает поиск групп в документе. Возвращает список групп."""
@@ -319,7 +356,7 @@ class PriceList:
         # собираем список рядов в виде tuple(уровень_ряда, номер_ряда)
         self._logger.info("Pulling groups and items from price list...")
         outline_levels = []
-        for row in range(4, self._worksheet.max_row + 1):
+        for row in range(3, self._worksheet.max_row + 1):
             outline_levels.append((self._worksheet.row_dimensions[row].outline_level, row))
         groups = cleanup(splitter(outline_levels))
         groups.insert(0, 1)
@@ -419,7 +456,7 @@ class PriceList:
         # item_row_style = CellFormat(backgroundColor=Color(1, 1, 0),  # yellow
         #                             textFormat=TextFormat(bold=False),
         #                             horizontalAlignment='LEFT', verticalAlignment='MIDDLE')
-        self._logger.info("Sending sheets to project with 15s timeout to prevent API overload.")
+        self._logger.info("Sending sheets to project with 10s timeout to prevent API overload.")
         for i in range(len(self._item_pages)):  # цикл по страницам
             batch_update = []
             cell_formats = []
@@ -429,19 +466,44 @@ class PriceList:
                     batch_update.append({'range': f'A{len(header_dict["batch_update"]) + y + 1}',
                                          'values': [[rows[y][0]]]})
                     cell_formats.append((
-                                        f'A{len(header_dict["batch_update"]) + y + 1}:{"ABCDEFGH"[len(col_names) - 1]}{len(header_dict["batch_update"]) + y + 1}',
-                                        group_row_style,))
+                        f'A{len(header_dict["batch_update"]) + y + 1}:{"ABCDEFGH"[len(col_names) - 1]}{len(header_dict["batch_update"]) + y + 1}',
+                        group_row_style,))
                 else:  # иначе это товар
-                    batch_update.append({'range': f'A{len(header_dict["batch_update"]) + y + 1}:{"ABCDEFGH"[len(col_names) - 1]}{len(header_dict["batch_update"]) + y + 1}',
-                                         'values': [rows[y]]})
+                    batch_update.append({
+                                            'range': f'A{len(header_dict["batch_update"]) + y + 1}:{"ABCDEFGH"[len(col_names) - 1]}{len(header_dict["batch_update"]) + y + 1}',
+                                            'values': [rows[y]]})
                     # cell_formats.append((
                     #                     f'A{len(header_dict["batch_update"]) + y + 1}:{"ABCDEFGH"[len(col_names) - 1]}{len(header_dict["batch_update"]) + y + 1}',
                     #                     item_row_style,))
             self._editor.update_sheet(i, header_dict, batch_update, cell_formats)
             self._logger.info(f"Sheet {self._item_pages[i].name} sent.")
             if i + 1 != len(self._item_pages):
-                time.sleep(15)
+                time.sleep(10)
 
 
 if __name__ == '__main__':
-    price = PriceList("PRC_202204100144.xlsx")
+    log = logger()
+    log.info("============================================================")
+    log.info("Obtaining file...")
+    new_file_data = grab_url_file_to_memory(URL)
+    log.info("Got it.")
+    if os.path.isfile(FOLDER + "pricelist.xlsx"):  # проверить, существует ли файл pricelist.xlsx
+        saved_file_data = io.BytesIO(open(FOLDER + "pricelist.xlsx", 'rb').read())  # читаем существующий файл в память
+        log.info("Comparing new file to old...")
+        if xlsx_compare(new_file_data, saved_file_data):
+            log.info("No changes. Shutting down.")
+            sys.exit()
+        else:
+            log.info("Changes found, updating.")
+            PriceList(log, new_file_data)
+            log.info("Update finished. Saving file...")
+            with open(FOLDER + "pricelist.xlsx", 'wb') as outfile:
+                outfile.write(new_file_data.getvalue())
+            log.info("Saved. Shutting down.")
+    else:
+        log.info("Updating...")
+        PriceList(log, new_file_data)
+        log.info("Update finished. Saving file...")
+        with open(FOLDER + "pricelist.xlsx", 'wb') as outfile:
+            outfile.write(new_file_data.getvalue())
+        log.info("Saved. Shutting down.")

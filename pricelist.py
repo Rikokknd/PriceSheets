@@ -86,7 +86,7 @@ class Header:
     def _set_keywords(self):
         self._keywords = [["Xiaomi", "Redmi"], ["iPhone", "iPh"], ["Huawei"], ["Samsung"],
                           ["Realme", "Oppo"], ["Meizu"], ['Nokia'], ['ZTE'], ['SONY'],
-                          ['LENOVO'], ['onePlus'], ['LeEco'], ['Разборка телефонов', 'Б/У'], ["Остальное"]]
+                          ['LENOVO'], ['onePlus'], ['LeEco'], ['Разборка телефонов', 'Б/У'], ["SSD"], ["Остальное"]]
 
     def get_keywords(self):
         return self._keywords
@@ -113,10 +113,12 @@ class Header:
 
 @singleton
 class GoogleSpreadsheetEditor:
-    def __init__(self):
+    def __init__(self, update_only_time=False):
         self.spreadsheet = self.auth_workbook()
         self.sheet_titles = ['\\'.join(x) for x in Header().get_keywords()]
         self._check_worksheets()
+        if update_only_time:
+            self.update_time()
 
     @staticmethod
     def auth_workbook():
@@ -164,6 +166,17 @@ class GoogleSpreadsheetEditor:
         sheet.batch_update(update)
         if len(formats) > 0:
             format_cell_ranges(sheet, formats)
+
+    def update_time(self):
+        """Обновляем только время последнего обновления в ячейке B1 на каждой странице"""
+        dt = f"Последнее обновление: {datetime.now().strftime('%H:%M %d/%m')}"
+        for sheet_index in range(len(self.sheet_titles)):
+            sheet = self.spreadsheet.get_worksheet(sheet_index)
+            sheet.batch_update([{
+                'range' : 'B1',
+                'values' : [[dt]]
+            }])
+            time.sleep(2)
 
 
 class Item:
@@ -491,7 +504,8 @@ if __name__ == '__main__':
         saved_file_data = io.BytesIO(open(FOLDER + "pricelist.xlsx", 'rb').read())  # читаем существующий файл в память
         log.info("Comparing new file to old...")
         if xlsx_compare(new_file_data, saved_file_data):
-            log.info("No changes. Shutting down.")
+            GoogleSpreadsheetEditor(True)
+            log.info("No changes. Time updated. Shutting down.")
             sys.exit()
         else:
             log.info("Changes found, updating.")
